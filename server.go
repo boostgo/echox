@@ -6,91 +6,44 @@ import (
 	"time"
 
 	"github.com/boostgo/appx"
-	"github.com/boostgo/errorx"
+	"github.com/boostgo/configx"
+	"github.com/boostgo/convert"
+	"github.com/boostgo/httpx"
 	"github.com/boostgo/log"
+	"github.com/boostgo/trace"
 	"github.com/google/uuid"
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
 )
 
-type route struct {
-	Method      string
-	Path        string
-	Handler     echo.HandlerFunc
-	Middlewares []echo.MiddlewareFunc
-}
-
-var (
-	_routes = make([]route, 0)
-)
-
-type Router interface {
-	Any(path string, h echo.HandlerFunc, m ...echo.MiddlewareFunc) []*echo.Route
-	POST(path string, h echo.HandlerFunc, m ...echo.MiddlewareFunc) *echo.Route
-	GET(path string, h echo.HandlerFunc, m ...echo.MiddlewareFunc) *echo.Route
-	PUT(path string, h echo.HandlerFunc, m ...echo.MiddlewareFunc) *echo.Route
-	DELETE(path string, h echo.HandlerFunc, m ...echo.MiddlewareFunc) *echo.Route
-	HEAD(path string, h echo.HandlerFunc, m ...echo.MiddlewareFunc) *echo.Route
-	OPTIONS(path string, h echo.HandlerFunc, m ...echo.MiddlewareFunc) *echo.Route
-	Use(m ...echo.MiddlewareFunc)
-	RouteNotFound(path string, h echo.HandlerFunc, m ...echo.MiddlewareFunc) *echo.Route
-	Group(prefix string, m ...echo.MiddlewareFunc) (g *echo.Group)
-}
-
-func RegisterRoute(method, path string, handlerFunc echo.HandlerFunc, m ...echo.MiddlewareFunc) {
-	_routes = append(_routes, route{
-		Method:      method,
-		Path:        path,
-		Handler:     handlerFunc,
-		Middlewares: m,
-	})
-}
-
-func GET(path string, handlerFunc echo.HandlerFunc, m ...echo.MiddlewareFunc) {
-	RegisterRoute(http.MethodGet, path, handlerFunc, m...)
-}
-
-func POST(path string, handlerFunc echo.HandlerFunc, m ...echo.MiddlewareFunc) {
-	RegisterRoute(http.MethodPost, path, handlerFunc, m...)
-}
-
-func PUT(path string, handlerFunc echo.HandlerFunc, m ...echo.MiddlewareFunc) {
-	RegisterRoute(http.MethodPut, path, handlerFunc, m...)
-}
-
-func PATCH(path string, handlerFunc echo.HandlerFunc, m ...echo.MiddlewareFunc) {
-	RegisterRoute(http.MethodPatch, path, handlerFunc, m...)
-}
-
-func DELETE(path string, handlerFunc echo.HandlerFunc, m ...echo.MiddlewareFunc) {
-	RegisterRoute(http.MethodDelete, path, handlerFunc, m...)
-}
-
 func run(address string) error {
 	handler := echo.New()
 
+	// add CORS middleware
 	handler.Use(middleware.CORSWithConfig(middleware.CORSConfig{
 		AllowOrigins:     []string{"*"},
 		AllowHeaders:     []string{"Content-Type", "Authorization", "X-Auth-Token"},
 		AllowCredentials: true,
 	}))
+
+	// add recover middleware
 	handler.Use(RecoverMiddleware())
 
+	// register not found route
 	handler.RouteNotFound("*", func(ctx echo.Context) error {
-		return Error(ctx, errorx.
-			New("Route not found").
-			SetError(errorx.ErrNotFound).
-			AddContext("url", ctx.Request().RequestURI))
+		return Error(ctx, newRouteNotFoundError(ctx.Request()))
 	})
 
-	if getTracer().AmIMaster() {
+	// add trace middleware
+	if trace.AmIMaster() {
 		handler.Use(middleware.RequestIDWithConfig(middleware.RequestIDConfig{
 			Generator: uuid.NewString,
 			RequestIDHandler: func(ctx echo.Context, traceID string) {
-				ctx.SetRequest(
-					ctx.Request().WithContext(getTracer().Set(ctx.Request().Context())))
+				requestCtx := ctx.Request().Context()
+				requestCtx = trace.SetID(requestCtx, traceID)
+				ctx.SetRequest(ctx.Request().WithContext(requestCtx))
 			},
-			TargetHeader: "X-Trace-ID",
+			TargetHeader: TraceKey,
 		}))
 	}
 
@@ -104,38 +57,69 @@ func run(address string) error {
 		handler.Add(r.Method, r.Path, r.Handler, r.Middlewares...)
 	}
 
+	// set groups
+	for _, g := range _groups {
+		group := handler.Group(g.basePath, g.middlewares...)
+		for _, r := range g.routes {
+			group.Add(r.Method, r.Path, r.Handler, r.Middlewares...)
+		}
+	}
+
+	// add server shutdown teardown func
 	appx.Tear(func() error {
 		return handler.Shutdown(appx.Context())
 	})
 
+	// print all registered routes (only in dev mode)
+	if configx.Production() {
+		log.
+			Info().
+			Int("routes_count", len(handler.Routes())).
+			Msg("Registered routes")
+
+		for idx, r := range handler.Routes() {
+			log.
+				Info().
+				Str("method", r.Method).
+				Str("path", r.Path).
+				Str("name", r.Name).
+				Msg(convert.StringFromInt(idx+1) + ". Registered route")
+		}
+	}
+
+	// start server
 	if err := handler.Start(address); err != nil {
 		if errors.Is(err, http.ErrServerClosed) {
 			return nil
 		}
 
-		return errorx.
-			New("Start server").
-			SetError(err)
+		return httpx.ErrStartServer.SetError(err)
 	}
 
 	return nil
 }
 
 func Run(address string, waitTime ...time.Duration) {
+	// run server in new goroutine
 	go func() {
 		if err := run(address); err != nil {
 			log.
 				Error().
 				Err(err).
 				Msg("Run server")
+
+			// if server run failed - call app shutdown
 			appx.Cancel()
 		}
 	}()
 
+	// add app graceful shutdown log
 	appx.GracefulLog(func() {
 		log.
 			Info().
 			Msg("Graceful shutdown...")
 	})
+
+	// wait till the end of app lifetime
 	appx.Wait(waitTime...)
 }

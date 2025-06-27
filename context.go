@@ -4,40 +4,31 @@ import (
 	"context"
 	"io"
 	"net/http"
-	"sync"
 	"time"
 
-	"github.com/boostgo/errorx"
+	"github.com/boostgo/contextx"
+	"github.com/boostgo/defaultx"
 	"github.com/boostgo/httpx"
-	"github.com/boostgo/httpx/validator"
+	"github.com/boostgo/validatex"
 	"github.com/labstack/echo/v4"
 )
 
-var (
-	_validator     *validator.Validator
-	_validatorOnce sync.Once
-)
-
-func init() {
-	_validatorOnce.Do(func() {
-		_validator, _ = validator.New()
-	})
-}
-
 // Param returns [param.Param] object got from named path variable or not found param error.
 func Param(ctx echo.Context, paramName string) (httpx.Param, error) {
+	if err := contextx.Validate(Context(ctx)); err != nil {
+		return httpx.EmptyParam(), err
+	}
+
 	value := ctx.Param(paramName)
 	if value == "" {
-		return httpx.Param{}, errorx.
-			New("Path param is empty").
-			SetError(errorx.ErrUnprocessableEntity).
-			AddContext("param-name", paramName)
+		return httpx.EmptyParam(), httpx.NewEmptyPathParamError(paramName)
 	}
 
 	return httpx.NewParam(value), nil
 }
 
-// QueryParam returns query param variable as [param.Param] object or empty [param.Param] object if query param is not found.
+// QueryParam returns query param variable as [param.Param] object or empty [param.Param] object
+// if query param is not found.
 func QueryParam(ctx echo.Context, queryParamName string) httpx.Param {
 	value := ctx.QueryParam(queryParamName)
 	if value == "" {
@@ -53,15 +44,23 @@ func QueryParam(ctx echo.Context, queryParamName string) httpx.Param {
 //
 // After success format converting, run structure validation (for "validate" tags)
 func Parse(ctx echo.Context, export any) error {
-	if err := ctx.Bind(export); err != nil {
-		return errorx.
-			New("Parse request body").
-			SetError(err, errorx.ErrUnprocessableEntity)
+	if err := contextx.Validate(Context(ctx)); err != nil {
+		return err
 	}
 
-	// todo: impl formatter
+	if err := ctx.Bind(export); err != nil {
+		return newParseRequestBodyError(ctx, err)
+	}
 
-	return _validator.Struct(export)
+	if err := validatex.Get().Struct(export); err != nil {
+		return err
+	}
+
+	if err := defaultx.Set(export); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 // Body returns request body as []byte (slice of bytes)
@@ -79,20 +78,29 @@ func SetContext(ctx echo.Context, native context.Context) {
 	ctx.SetRequest(ctx.Request().WithContext(native))
 }
 
+// Set sets new key-value pair as context to request context.
+func Set(ctx echo.Context, key string, value any) {
+	native := Context(ctx)
+	native = context.WithValue(native, key, value)
+	SetContext(ctx, native)
+}
+
 // File returns file as []byte (slice of bytes) from request by file name.
 //
 // Request body must be form data
-func File(ctx echo.Context, name string) (content []byte, err error) {
-	defer errorx.Wrap("API", &err, "Read form file error")
+func File(ctx echo.Context, name string) ([]byte, error) {
+	if err := contextx.Validate(Context(ctx)); err != nil {
+		return nil, err
+	}
 
 	header, err := ctx.FormFile(name)
 	if err != nil {
-		return content, err
+		return nil, httpx.ErrReadFormFile.SetError(err)
 	}
 
 	file, err := header.Open()
 	if err != nil {
-		return content, err
+		return nil, httpx.ErrOpenFormFile.SetError(err)
 	}
 	defer file.Close()
 
@@ -103,6 +111,10 @@ func File(ctx echo.Context, name string) (content []byte, err error) {
 //
 // Notice: in this map no any files. Parse them by [File] function
 func ParseForm(ctx echo.Context) (map[string]httpx.Param, error) {
+	if err := contextx.Validate(Context(ctx)); err != nil {
+		return nil, err
+	}
+
 	form, err := ctx.MultipartForm()
 	if err != nil {
 		return nil, err
@@ -158,4 +170,8 @@ func Cookies(ctx echo.Context) map[string]any {
 // SetCookie sets new cookie to response
 func SetCookie(ctx echo.Context, key, value string, ttl ...time.Duration) {
 	ctx.SetCookie(httpx.NewCookie(key, value, ttl...))
+}
+
+func StatusCode(ctx echo.Context) int {
+	return ctx.Response().Status
 }

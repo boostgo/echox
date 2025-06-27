@@ -1,34 +1,33 @@
+// Package echox provides echo library manipulating tools.
+// Features:
+// - Simple response functions - Ok, Error, Failure, Success.
+// - Running server with registered recover, trace and other middlewares and using appx global context
+// - Reading request data by using echo.Context
 package echox
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"reflect"
 
 	"github.com/boostgo/convert"
+	"github.com/boostgo/errorx"
 	"github.com/boostgo/httpx"
+	"github.com/boostgo/log"
 	"github.com/boostgo/trace"
+
 	"github.com/google/uuid"
 	"github.com/labstack/echo/v4"
 )
 
 const (
-	TraceKey = "X-Trace-ID"
+	TraceProtocol = "http"
+	TraceKey      = "X-Trace-ID"
 )
 
-var (
-	_tracer *trace.Tracer
-)
-
-func InitTracer(tracer *trace.Tracer) {
-	_tracer = tracer
-}
-
-func getTracer() *trace.Tracer {
-	if _tracer == nil {
-		_tracer = trace.NewTracer(TraceKey)
-	}
-	return _tracer
+func init() {
+	trace.RegisterProtocol(TraceProtocol, TraceKey)
 }
 
 // Failure returns response with some error status and convert provided error to
@@ -40,14 +39,35 @@ func getTracer() *trace.Tracer {
 //
 // If errors is custom and there is "trace" key in context, it will be ignored for outputError
 func Failure(ctx echo.Context, status int, err error) error {
-	// set trace ID
-	traceID := getTracer().Get(Context(ctx))
+	// set trace ID to response
+	traceID := trace.Get(Context(ctx))
 	if traceID != "" {
 		ctx.Response().Header().Set(TraceKey, traceID)
 		ctx.Response().Header().Set("X-Request-ID", traceID)
 	}
 
-	response := httpx.NewFailureResponse(err)
+	// print error log
+	log.
+		Error().
+		Ctx(Context(ctx)).
+		Err(err).
+		Int("status", status).
+		Str("method", ctx.Request().Method).
+		Msg(ctx.Request().RequestURI)
+
+	// try convert provide error to custom errorx.Error
+	var convertedError *errorx.Error
+	if !errors.As(err, &convertedError) {
+		convertedError = httpx.ErrorByStatusCode(status)
+	}
+
+	// run failure middlewares
+	for _, m := range failureMiddlewares {
+		m(ctx, status, convertedError)
+	}
+
+	// create response body
+	response := httpx.NewFailureResponse(convertedError, status, traceID)
 	blob, _ := json.Marshal(response)
 
 	// convert output object to bytes
@@ -72,26 +92,37 @@ func Error(ctx echo.Context, err error) error {
 // If body is not provided, will be returned empty string
 func Success(ctx echo.Context, status int, body ...any) error {
 	// set trace ID
-	traceID := getTracer().Get(Context(ctx))
+	traceID := trace.Get(Context(ctx))
 	if traceID != "" {
 		ctx.Response().Header().Set(TraceKey, traceID)
 		ctx.Response().Header().Set("X-Request-ID", traceID)
 	}
+
+	// print success response log
+	log.
+		Info().
+		Ctx(Context(ctx)).
+		Int("status", status).
+		Str("method", ctx.Request().Method).
+		Msg(ctx.Request().RequestURI)
 
 	// return empty response if no response body
 	if len(body) == 0 {
 		return ctx.String(status, "")
 	}
 
+	// return string if response body is primitive (int, float, bool, etc...)
 	if isPrimitive(body[0]) {
 		return ctx.String(status, convert.String(body[0]))
 	}
 
+	// if raw middleware set, return without SuccessResponse wrapper struct
 	if isRaw(ctx) {
 		return ctx.JSON(status, body[0])
 	}
 
-	return ctx.JSON(status, httpx.NewSuccessResponse(body[0]))
+	// return response with SuccessResponse wrapper struct
+	return ctx.JSON(status, httpx.NewSuccessResponse(body[0], status, traceID))
 }
 
 // SuccessRaw returns response in "raw" way

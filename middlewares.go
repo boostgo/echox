@@ -13,18 +13,19 @@ import (
 	"github.com/boostgo/httpx"
 	"github.com/boostgo/log"
 	"github.com/labstack/echo/v4"
-	"github.com/labstack/echo/v4/middleware"
 )
 
 const (
 	rawResponseKey = "response-raw"
 )
 
-var (
-	_middlewares = make([]echo.MiddlewareFunc, 0)
-)
+var _middlewares = make([]echo.MiddlewareFunc, 0)
 
 func RegisterMiddleware(mid echo.MiddlewareFunc) {
+	if mid == nil {
+		return
+	}
+
 	_middlewares = append(_middlewares, mid)
 }
 
@@ -43,22 +44,36 @@ func RecoverMiddleware() echo.MiddlewareFunc {
 }
 
 func TimeoutMiddleware(duration time.Duration) echo.MiddlewareFunc {
-	return middleware.ContextTimeoutWithConfig(middleware.ContextTimeoutConfig{
-		Skipper: middleware.DefaultSkipper,
-		ErrorHandler: func(err error, ctx echo.Context) error {
-			return Error(
-				ctx,
-				errorx.
-					New("Request reached timeout").
-					SetError(err, errorx.ErrTimeout),
-			)
-		},
-		Timeout: duration,
-	})
+	return func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(ctx echo.Context) error {
+			done := make(chan error, 1)
+
+			native, cancel := context.WithTimeout(Context(ctx), duration)
+			defer cancel()
+
+			SetContext(ctx, native)
+
+			go func() {
+				done <- next(ctx)
+			}()
+
+			select {
+			case err := <-done:
+				if err != nil {
+					return Error(ctx, err)
+				}
+
+				return nil
+			case <-time.After(duration):
+				return Error(ctx, errorx.ErrTimeout)
+			}
+		}
+	}
 }
 
-// Raw if middleware set, all responses by this middleware will be returned in "raw" way (no successOutput object)
-func Raw() echo.MiddlewareFunc {
+// RawMiddleware if middleware set
+// all responses by this middleware will be returned in "raw" way (no successOutput object)
+func RawMiddleware() echo.MiddlewareFunc {
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(ctx echo.Context) error {
 			localCtx := Context(ctx)
@@ -69,7 +84,7 @@ func Raw() echo.MiddlewareFunc {
 	}
 }
 
-func Cache(ttl time.Duration, distributor httpx.CacheDistributor) echo.MiddlewareFunc {
+func CacheMiddleware(ttl time.Duration, distributor httpx.CacheDistributor) echo.MiddlewareFunc {
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(ctx echo.Context) error {
 			// try load response from cache
@@ -79,7 +94,8 @@ func Cache(ttl time.Duration, distributor httpx.CacheDistributor) echo.Middlewar
 
 				if !errors.Is(err, errorx.ErrNotFound) {
 					log.
-						Error(Context(ctx)).
+						Error().
+						Ctx(Context(ctx)).
 						Err(err).
 						Msg("Get cache by HTTP distributor")
 				}
@@ -105,9 +121,28 @@ func Cache(ttl time.Duration, distributor httpx.CacheDistributor) echo.Middlewar
 			// set response to cache
 			if err = distributor.Set(Context(ctx), ctx.Request(), responseBody, ttl); err != nil {
 				log.
-					Error(Context(ctx)).
+					Error().
+					Ctx(Context(ctx)).
 					Err(err).
 					Msg("Set cache by HTTP distributor")
+			}
+
+			return nil
+		}
+	}
+}
+
+func LoggerMiddleware() echo.MiddlewareFunc {
+	return func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(ctx echo.Context) error {
+			log.
+				Info().
+				Ctx(Context(ctx)).
+				Str("method", ctx.Request().Method).
+				Msg(ctx.Request().RequestURI)
+
+			if err := next(ctx); err != nil {
+				return err
 			}
 
 			return nil
